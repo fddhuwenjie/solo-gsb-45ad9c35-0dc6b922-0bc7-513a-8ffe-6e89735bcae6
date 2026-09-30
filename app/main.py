@@ -9,6 +9,7 @@ from .routers import (
     announcements,
     clock,
     events,
+    penalties,
     result_reviews,
     rounds,
     stations,
@@ -45,9 +46,14 @@ app = FastAPI(
         "分别同意/驳回（重复决定返回原结果、改票不产生额外记录），任一"
         "驳回即关闭且比分不变，双方同意在同一事务内更正比分、重算可见"
         "排名并写入关闭事件；有待处理复核时禁止生成下一轮。"
+        "支持可追溯的扣分账本：裁判按幂等键与事件序号快照为参赛者登记"
+        "半分整数倍的扣分（仅允许在所有已生成轮次结束且无待处理复核时），"
+        "可以新记录撤销一笔仍生效的扣分；排名保留对局积分并返回有效扣分"
+        "与排名积分（可为负），排序、Buchholz 与下一轮积分分组均以排名"
+        "积分为准，账本可按参赛者完整查询。"
         "另提供每赛事独立序号、可断线续传的 SSE 赛事事件流。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -63,4 +69,5 @@ app.include_router(stations.router)
 app.include_router(clock.router)
 app.include_router(announcements.router)
 app.include_router(result_reviews.router)
+app.include_router(penalties.router)
 app.include_router(events.router)

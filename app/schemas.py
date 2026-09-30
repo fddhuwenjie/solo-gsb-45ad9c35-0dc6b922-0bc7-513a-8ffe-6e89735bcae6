@@ -101,7 +101,14 @@ class StandingResponse(BaseModel):
     participant_id: int
     number: int
     name: str
+    # 对局积分（赛果累计，不含扣分）
     points: float
+    # 当前有效扣分（账本中生效扣分条目之和）
+    penalty: float
+    # 排名积分 = 对局积分 - 有效扣分（允许为负）；
+    # 排序、Buchholz 与下一轮积分分组均以此为准
+    rank_points: float
+    # Buchholz：实际对手的排名积分之和（随对手扣分重算）
     buchholz: float
     played: int
     byes: int
@@ -541,3 +548,81 @@ class ResultReviewResponse(BaseModel):
     @field_serializer("created_at", "closed_at")
     def serialize_times(self, v: datetime | None) -> str | None:
         return _serialize_utc(v)
+
+
+# ---------- Penalty ledger ----------
+
+def _validate_half_point_multiple(v: float) -> float:
+    """扣分量必须是 0.5 的整数倍（半分单位的正整数）。"""
+    doubled = v * 2
+    if abs(doubled - round(doubled)) > 1e-9:
+        raise ValueError("扣分必须是 0.5 的整数倍")
+    return v
+
+
+class PenaltyDeductRequest(BaseModel):
+    """登记一笔扣分。"""
+
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_event_seq: int = Field(
+        ge=0,
+        description="期望的赛事当前最大事件序号；不一致返回 409 且不落库",
+    )
+    participant_id: int = Field(ge=1, description="被扣分的参赛者 id")
+    points: float = Field(gt=0, description="扣分量：0.5 的整数倍")
+    reason: str = Field(min_length=1, max_length=10_000, description="扣分理由")
+
+    @field_validator("points")
+    @classmethod
+    def _check_points(cls, v: float) -> float:
+        return _validate_half_point_multiple(v)
+
+
+class PenaltyRevokeRequest(BaseModel):
+    """以新记录撤销一笔仍生效的扣分。"""
+
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_event_seq: int = Field(
+        ge=0,
+        description="期望的赛事当前最大事件序号；不一致返回 409 且不落库",
+    )
+    reason: str = Field(min_length=1, max_length=10_000, description="撤销理由")
+
+
+class PenaltyEntryResponse(BaseModel):
+    id: int
+    tournament_id: int
+    participant_id: int
+    number: int
+    name: str
+    # deduct（登记扣分）/ revoke（撤销一笔扣分）
+    kind: str
+    # 扣分量；revoke 条目为被撤销的量
+    points: float
+    reason: str
+    # deduct：active / revoked；revoke：applied
+    status: str
+    # 仅 revoke 条目：被撤销的扣分条目 id
+    revokes_entry_id: int | None = None
+    expected_event_seq: int
+    created_at: datetime
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, v: datetime) -> str:
+        return _serialize_utc(v)
+
+
+class ParticipantPenaltyLedgerResponse(BaseModel):
+    """参赛者的完整扣分账本：逐条记录 + 当前有效扣分合计。"""
+
+    participant_id: int
+    number: int
+    name: str
+    # 当前有效扣分（生效中的 deduct 条目之和）
+    effective_penalty: float
+    # 全部账本条目（含已撤销的扣分与撤销记录，按登记顺序）
+    entries: list[PenaltyEntryResponse]

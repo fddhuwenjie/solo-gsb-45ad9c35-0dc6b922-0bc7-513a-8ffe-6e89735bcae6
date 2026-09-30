@@ -1,8 +1,10 @@
-"""积分与 Buchholz 分计算。
+"""积分、有效扣分与 Buchholz 分计算。
 
 积分以「半分」为单位的整数存储与计算，对外输出时除以 2。
 - 胜 = 1，和 = 0.5，负 = 0；
-- 轮空按胜场计 1 分，且轮空不计对手 Buchholz 贡献（0）。
+- 轮空按胜场计 1 分，且轮空不计对手 Buchholz 贡献（0）；
+- 排名积分 = 对局积分 - 有效扣分（可为负）；排序、Buchholz 与
+  下一轮积分分组均以排名积分为准，Buchholz 取对手的排名积分之和。
 """
 from dataclasses import dataclass
 
@@ -17,8 +19,10 @@ class Record:
     participant_id: int
     number: int
     name: str
-    points: int          # 半分单位
-    buchholz: int        # 对手累计积分之和（半分单位）
+    points: int          # 对局积分（半分单位，不含扣分）
+    penalty: int         # 当前有效扣分（半分单位，非负）
+    rank_points: int     # 排名积分 = 对局积分 - 有效扣分（可为负）
+    buchholz: int        # 对手累计排名积分之和（半分单位）
     played: int          # 实际对局数（不含轮空）
     byes: int            # 轮空次数
 
@@ -33,7 +37,11 @@ def compute_records(
     include_open=False（编排下一轮时使用）：只统计已结束轮次。
     include_open=True（排名查询使用）：同时实时计入进行中轮次里
     已经录入的对局与在生成轮次时即确定的轮空。
+    有效扣分（账本中生效的扣分条目）两种口径都计入排名积分。
     """
+    # 延迟导入：penalties 服务依赖本模块的 half_to_float
+    from .penalties import effective_penalties
+
     participants = (
         db.query(Participant)
         .filter(Participant.tournament_id == tournament_id)
@@ -78,24 +86,33 @@ def compute_records(
         opponents[m.player_white_id].append(m.player_black_id)
         opponents[m.player_black_id].append(m.player_white_id)
 
-    # Buchholz：实际对手的当前积分之和（两遍计算，点数组已固定）
+    # 有效扣分（半分单位）：排名积分 = 对局积分 - 有效扣分（可为负）
+    penalties = effective_penalties(db, tournament_id)
+    rank_points = {
+        p.id: points[p.id] - penalties.get(p.id, 0) for p in participants
+    }
+
+    # Buchholz：实际对手的当前排名积分之和（随对手扣分重算；
+    # 点数组已固定，两遍计算）
     records: list[Record] = []
     for p in participants:
-        buch = sum(points[o] for o in opponents[p.id])
+        buch = sum(rank_points[o] for o in opponents[p.id])
         records.append(
             Record(
                 participant_id=p.id,
                 number=p.number,
                 name=p.name,
                 points=points[p.id],
+                penalty=penalties.get(p.id, 0),
+                rank_points=rank_points[p.id],
                 buchholz=buch,
                 played=played[p.id],
                 byes=byes[p.id],
             )
         )
 
-    # 排名：积分降序 -> Buchholz 降序 -> 编号升序
-    records.sort(key=lambda r: (-r.points, -r.buchholz, r.number))
+    # 排名：排名积分降序 -> Buchholz 降序 -> 编号升序
+    records.sort(key=lambda r: (-r.rank_points, -r.buchholz, r.number))
     return records
 
 

@@ -41,6 +41,15 @@
   写事务内**更正比分、重算可见排名并写入复核关闭事件。赛事存在待
   处理复核时**禁止生成下一轮**；复核详情与赛事列表完整保留原比分、
   提议、双方决定与最终状态。
+- **可追溯的扣分账本**：裁判可为参赛者登记**半分整数倍**的扣分
+  （携带 `request_id` 幂等键与 `expected_event_seq` 序号快照、理由），
+  也可以一条**新记录撤销**仍生效的扣分（原扣分保留并置为已撤销）；
+  仅允许在**所有已生成轮次结束且没有待处理赛果复核**时登记或撤销。
+  重复请求原样返回首次结果，快照冲突、重复撤销一律 `409` 不落库。
+  排名保留**对局积分**，并返回**有效扣分**与**排名积分**（= 对局
+  积分 − 有效扣分，**允许为负**）；排序、Buchholz（随对手的排名
+  积分重算）与下一轮积分分组均以排名积分为准。账本只增不改，可按
+  参赛者查询完整记录。
 
 配对在 Edmonds 带花树（Blossom）最小权完美匹配算法上实现
 （`networkx.min_weight_matching`，O(n³)），同代价方案用可加的
@@ -152,7 +161,7 @@ curl -X PUT http://localhost:8000/matches/2/result \
   -d '{"score_white": 0.5, "score_black": 0.5}'
 ```
 
-### 5. 查询排名（含 Buchholz 分）
+### 5. 查询排名（含有效扣分、排名积分与 Buchholz 分）
 
 ```bash
 curl http://localhost:8000/tournaments/1/standings
@@ -161,22 +170,29 @@ curl http://localhost:8000/tournaments/1/standings
 ```json
 [
   {"rank": 1, "participant_id": 1, "number": 1, "name": "Alice",
-   "points": 1.0, "buchholz": 0.0, "played": 1, "byes": 0},
+   "points": 1.0, "penalty": 0.0, "rank_points": 1.0,
+   "buchholz": 0.0, "played": 1, "byes": 0},
   {"rank": 2, "participant_id": 5, "number": 5, "name": "Eve",
-   "points": 1.0, "buchholz": 0.0, "played": 0, "byes": 1},
+   "points": 1.0, "penalty": 0.0, "rank_points": 1.0,
+   "buchholz": 0.0, "played": 0, "byes": 1},
   {"rank": 3, "participant_id": 3, "number": 3, "name": "Cara",
-   "points": 0.5, "buchholz": 0.5, "played": 1, "byes": 0},
+   "points": 0.5, "penalty": 0.0, "rank_points": 0.5,
+   "buchholz": 0.5, "played": 1, "byes": 0},
   {"rank": 4, "participant_id": 4, "number": 4, "name": "Dan",
-   "points": 0.5, "buchholz": 0.5, "played": 1, "byes": 0},
+   "points": 0.5, "penalty": 0.0, "rank_points": 0.5,
+   "buchholz": 0.5, "played": 1, "byes": 0},
   {"rank": 5, "participant_id": 2, "number": 2, "name": "Bob",
-   "points": 0.0, "buchholz": 1.0, "played": 1, "byes": 0}
+   "points": 0.0, "penalty": 0.0, "rank_points": 0.0,
+   "buchholz": 1.0, "played": 1, "byes": 0}
 ]
 ```
 
-排名规则：`points` 降序 → `buchholz`（所有实际对阵对手的累计积分之和，
-轮空不计对手）降序 → `number` 升序。上例中 Alice、Eve 同为 1 分
-且 Buchholz 均为 0，编号小的 Alice 居首；Bob 虽 0 分，但因输给
-Alice，Buchholz 为 1.0。
+排名规则：`rank_points`（**排名积分** = 对局积分 `points` − 当前有效
+扣分 `penalty`，允许为负）降序 → `buchholz`（所有实际对阵对手的
+**排名积分**之和，轮空不计对手，随对手扣分重算）降序 → `number`
+升序。上例中 Alice、Eve 同为 1 分且 Buchholz 均为 0，编号小的
+Alice 居首；Bob 虽 0 分，但因输给 Alice，Buchholz 为 1.0。无扣分
+时 `rank_points` 与 `points` 一致、`penalty` 为 0。
 
 ### 6. 订阅赛事事件流（SSE，供现场大屏 / 解说端）
 
@@ -222,7 +238,7 @@ data: {"tournament_id": 1, "seq": 6, "type": "round.generated",
   `round_clock.paused`、`round_clock.resumed`、
   `round_clock.extended`、`announcement.published`、
   `announcement.acknowledged`、`result_review.created`、
-  `result_review.closed`；
+  `result_review.closed`、`penalty.recorded`、`penalty.revoked`；
 - 事件与业务变更在**同一数据库事务**中写入：事务回滚则事件一并
   回滚，不会出现"有事件无变更"或"有变更无事件"；
 - **并发安全**：事件序号不再"查询最大 seq 后插入"，而是对
@@ -718,6 +734,150 @@ curl http://localhost:8000/tournaments/1/result-reviews
   `result_review.closed` 事件在同一事务提交，要么全部生效要么全部
   回滚；待处理复核存在期间生成下一轮、修改该场赛果一律 `409`。
 
+### 13. 可追溯的扣分账本
+
+赛务争议处理中，裁判可为参赛者登记**扣分**（如迟到、违规），也可以
+一条**新记录撤销**仍生效的扣分。账本只增不改：撤销不删除原扣分，
+而是追加撤销记录并把原扣分置为 `revoked`，全程可追溯。
+
+**登记扣分**：`POST /tournaments/{id}/penalties`，请求携带：
+
+- `request_id`：幂等键（赛事内唯一），重复提交（相同参数）原样返回
+  首次结果；同一 `request_id` 携带不同参数返回 `409`；
+- `expected_event_seq`：登记前断言的赛事当前最大事件序号，用于
+  **乐观快照**——不一致返回 `409` 且不落库（先经
+  `GET /tournaments/{id}/events` 读取最新序号）；
+- `participant_id`：被扣分的参赛者；
+- `points`：扣分量，必须是 **0.5 的整数倍**（`0.5`、`1.0`、`1.5`…），
+  否则 `422`；
+- `reason`：扣分理由。
+
+**仅允许在所有已生成轮次结束且没有待处理赛果复核时**登记或撤销，
+否则 `409` 且不落库（尚未生成任何轮次时视为全部已结束，允许登记）。
+
+```bash
+# 先读取当前事件序号
+SEQ=$(curl -s http://localhost:8000/tournaments/1/events | python3 -c \
+  "import sys,json;print(json.load(sys.stdin)['last_seq'])")
+
+# 给选手 3 登记 0.5 分扣分
+curl -X POST http://localhost:8000/tournaments/1/penalties \
+  -H "Content-Type: application/json" \
+  -d "{\"request_id\": \"pen-1\", \"expected_event_seq\": $SEQ,
+       \"participant_id\": 3, \"points\": 0.5,
+       \"reason\": \"第 2 轮迟到 15 分钟\"}"
+```
+
+```json
+{
+  "id": 1, "tournament_id": 1, "participant_id": 3,
+  "number": 3, "name": "Cara",
+  "kind": "deduct", "points": 0.5,
+  "reason": "第 2 轮迟到 15 分钟",
+  "status": "active", "revokes_entry_id": null,
+  "expected_event_seq": 12,
+  "created_at": "2026-09-30T08:00:00.000000Z"
+}
+```
+
+登记与 `penalty.recorded` 事件在**同一事务**提交（载荷含 `entry_id`、
+`participant_id`、`points`、`reason` 与序号快照）。排名随即按新口径
+重算：`/standings` 中该选手 `penalty=0.5`、`rank_points` 比对局积分
+`points` 少 0.5（可为负），其对手的 `buchholz` 也随之按排名积分重算。
+
+**撤销扣分**：`POST /penalties/{entry_id}/revoke`，以一条新记录撤销
+一笔**仍生效**的扣分（`request_id` / `expected_event_seq` / `reason`
+语义同上）：
+
+```bash
+SEQ=$(curl -s http://localhost:8000/tournaments/1/events | python3 -c \
+  "import sys,json;print(json.load(sys.stdin)['last_seq'])")
+
+curl -X POST http://localhost:8000/penalties/1/revoke \
+  -H "Content-Type: application/json" \
+  -d "{\"request_id\": \"pen-1-revoke\", \"expected_event_seq\": $SEQ,
+       \"reason\": \"申诉成立，撤销扣分\"}"
+```
+
+```json
+{
+  "id": 2, "tournament_id": 1, "participant_id": 3,
+  "number": 3, "name": "Cara",
+  "kind": "revoke", "points": 0.5,
+  "reason": "申诉成立，撤销扣分",
+  "status": "applied", "revokes_entry_id": 1,
+  "expected_event_seq": 13,
+  "created_at": "2026-09-30T08:05:00.000000Z"
+}
+```
+
+撤销记录、原扣分的状态更新（`active` → `revoked`）与
+`penalty.revoked` 事件在**同一事务**提交；撤销后该笔扣分不再计入
+有效扣分，排名即时重算。
+
+**冲突示例**（均不落库、不占事件序号）：
+
+```bash
+# 快照冲突：期望序号落后/超前于当前最大序号 -> 409
+curl -X POST http://localhost:8000/tournaments/1/penalties \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "pen-2", "expected_event_seq": 3,
+       "participant_id": 3, "points": 0.5, "reason": "快照已过期"}'
+# {"detail": "赛事快照已变化：当前最大事件序号为 14，请求期望 3"}
+
+# 重复撤销：该扣分已被撤销（新 request_id 也不允许）-> 409
+curl -X POST http://localhost:8000/penalties/1/revoke \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "pen-1-revoke-2", "expected_event_seq": 14,
+       "reason": "再次撤销"}'
+# {"detail": "该扣分已被撤销，不能重复撤销"}
+
+# 撤销目标不是扣分条目（如撤销一条撤销记录）-> 409
+curl -X POST http://localhost:8000/penalties/2/revoke \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "pen-3", "expected_event_seq": 14,
+       "reason": "误操作"}'
+# {"detail": "该记录不是扣分条目，不能撤销"}
+
+# 轮次进行中 / 有待处理复核时登记 -> 409
+# {"detail": "第 2 轮尚未结束，不能登记或撤销扣分"}
+# {"detail": "赛事存在待处理的赛果复核，需待复核关闭后才能登记或撤销扣分"}
+
+# 同一 request_id 携带不同参数 -> 409
+# {"detail": "request_id 已被用于该赛事的其他扣分请求，请更换 request_id"}
+```
+
+**幂等重放**：重复提交同一 `request_id` 与相同参数（无论登记还是
+撤销）原样返回首次结果（HTTP `201`），不产生新记录、不占事件序号。
+
+**账本查询**：
+
+```bash
+# 赛事完整账本（按登记顺序，含已撤销的扣分与撤销记录）
+curl http://localhost:8000/tournaments/1/penalties
+
+# 按参赛者查询完整账本：逐条记录 + 当前有效扣分合计
+curl http://localhost:8000/tournaments/1/participants/3/penalties
+```
+
+```json
+{
+  "participant_id": 3, "number": 3, "name": "Cara",
+  "effective_penalty": 0.0,
+  "entries": [
+    {"id": 1, "kind": "deduct", "points": 0.5, "status": "revoked",
+     "reason": "第 2 轮迟到 15 分钟", "revokes_entry_id": null, "...": "..."},
+    {"id": 2, "kind": "revoke", "points": 0.5, "status": "applied",
+     "reason": "申诉成立，撤销扣分", "revokes_entry_id": 1, "...": "..."}
+  ]
+}
+```
+
+**排名口径**：`points`（对局积分）不受扣分影响；`penalty` 为当前
+有效扣分合计；`rank_points = points − penalty`（**允许为负**）是
+排序、Buchholz 与下一轮积分分组的唯一依据——被扣分者在下一轮会
+按扣分后的排名积分落入对应分组。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -753,8 +913,12 @@ curl http://localhost:8000/tournaments/1/result-reviews
 | POST | `/result-reviews/{id}/decisions` | 本场选手同意/驳回（重复决定返回原结果、改票不产生额外记录） |
 | GET | `/result-reviews/{id}` | 复核详情（原比分、提议、决定、最终状态） |
 | GET | `/tournaments/{id}/result-reviews` | 赛事下的复核列表 |
+| POST | `/tournaments/{id}/penalties` | 登记扣分（半分整数倍、幂等 + 序号快照；须全部轮次结束且无待处理复核） |
+| POST | `/penalties/{entry_id}/revoke` | 以新记录撤销一笔仍生效的扣分（幂等 + 序号快照；重复撤销 409） |
+| GET | `/tournaments/{id}/penalties` | 赛事完整扣分账本（按登记顺序） |
+| GET | `/tournaments/{id}/participants/{pid}/penalties` | 参赛者完整账本（逐条记录 + 当前有效扣分合计） |
 | PUT | `/matches/{match_id}/result` | 录入/修改一场赛果 |
-| GET | `/tournaments/{id}/standings` | 排名（含 Buchholz 分） |
+| GET | `/tournaments/{id}/standings` | 排名（对局积分、有效扣分、排名积分与 Buchholz 分） |
 | GET | `/tournaments/{id}/events/stream` | SSE 事件流（支持 `Last-Event-ID` 续传、心跳注释） |
 | GET | `/tournaments/{id}/events` | 事件分页查询（`after` / `limit`） |
 | GET | `/health` | 健康检查 |
@@ -824,7 +988,12 @@ request_id 幂等重放与冲突、待处理期间冻结赛果且禁止生成下
 仅本场选手可决定、重复决定返回原结果且改票原地更新、任一驳回
 关闭比分不变、双方同意同事务更正比分并重算排名、关闭事件与
 原比分/提议/决定/状态的完整保留、并发创建仅一成一败与并发重复
-决定只产生一条记录），以及
+决定只产生一条记录），扣分账本专项（半分整数倍校验、轮次进行中/
+有待处理复核时禁止登记或撤销、序号快照冲突 409 不落库不占号、
+request_id 幂等重放与冲突、撤销同事务置原扣分为已撤销、重复撤销
+与撤销非扣分条目 409、排名积分可为负且排序/Buchholz/下一轮分组
+均以排名积分为准、按参赛者与赛事的完整账本查询、并发撤销同一
+扣分仅一成一败、并发同键不同参数登记仅一成落库），以及
 事件流专项测试——事务回滚不留事件、
 提交失败不广播且不留事件、原子计数器回滚不占号、并发报名/赛果/
 开轮（多线程屏障同时放行）下编号与序号唯一连续、并发提交按序号

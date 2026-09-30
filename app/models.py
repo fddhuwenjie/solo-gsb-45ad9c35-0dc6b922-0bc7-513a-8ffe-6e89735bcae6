@@ -608,6 +608,66 @@ class ResultReviewDecision(Base):
     participant: Mapped[Participant] = relationship()
 
 
+class PenaltyEntry(Base):
+    """扣分账本条目：登记扣分（deduct）或撤销一笔扣分（revoke）。
+
+    账本只增不改：撤销不删除原扣分，而是追加一条 revoke 条目并把
+    被撤销扣分的 status 置为 revoked（同一事务内完成）；有效扣分
+    即 status=active 的 deduct 条目之和。条目同时充当幂等记录：
+    request_id 在赛事内唯一，重复请求按 params 指纹判定——一致则
+    原样返回 response 快照，不一致 409。被拒绝的请求（资格不符/
+    快照冲突/重复撤销，409）不落任何记录。
+    """
+
+    __tablename__ = "penalty_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "request_id", name="uq_penalty_entry_request"
+        ),
+        # 一笔扣分至多被撤销一次（数据库层兜底，重复撤销不落库）
+        Index(
+            "uq_penalty_revoke_target",
+            "revokes_entry_id",
+            unique=True,
+            postgresql_where=text("revokes_entry_id IS NOT NULL"),
+            sqlite_where=text("revokes_entry_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    participant_id: Mapped[int] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    # 客户端幂等键：赛事内唯一
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 登记前断言的赛事当前最大事件序号（乐观快照，不一致不落库）
+    expected_event_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    # deduct（登记扣分）/ revoke（撤销一笔扣分）
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 扣分量（半分单位的正整数）；revoke 条目冗余记录被撤销的量，
+    # 使账本单行即可读（被撤销的扣分条目不可变，冗余不会漂移）
+    points: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 扣分/撤销理由
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    # 撤销目标（仅 revoke 条目）：被撤销的 deduct 条目 id
+    revokes_entry_id: Mapped[int | None] = mapped_column(
+        ForeignKey("penalty_entries.id", ondelete="CASCADE"), nullable=True
+    )
+    # deduct：active（生效中）/ revoked（已被撤销）；
+    # revoke：applied（撤销条目本身不可再被撤销）
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 首次执行后的响应快照：重复 request_id 原样返回
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    participant: Mapped[Participant] = relationship()
+
+
 class ResultReviewAction(Base):
     """复核创建请求的幂等记录：同一 request_id 重放原样返回。
 
