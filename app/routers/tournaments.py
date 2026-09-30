@@ -233,7 +233,10 @@ def get_standings(tournament_id: int, db: Session = Depends(get_db)):
             participant_id=r.participant_id,
             number=r.number,
             name=r.name,
+            # points 为排名积分（对局积分 - 有效扣分，可为负）
             points=half_to_float(r.points),
+            game_points=half_to_float(r.game_points),
+            deduction=half_to_float(r.deduction),
             buchholz=half_to_float(r.buchholz),
             played=r.played,
             byes=r.byes,

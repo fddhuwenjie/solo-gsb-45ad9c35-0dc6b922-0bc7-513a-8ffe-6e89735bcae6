@@ -639,3 +639,98 @@ class ResultReviewAction(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
     )
+
+
+class PointDeductionEntry(Base):
+    """赛务争议扣分账本：append-only，扣分与撤销均为不可变的新记录。
+
+    - deduction 行登记一笔扣分（amount_halves 为正的半分整数倍），
+      初始 status=effective；
+    - 撤销不修改金额，而是追加一行 revocation（amount_halves 复制
+      原扣分值、reversed_entry_id 指向原扣分行），并把原行置为
+      revoked；revocation 行始终 effective，不能再被撤销；
+    - 每位参赛者的有效扣分 = 全部 deduction 金额之和 − 全部
+      revocation 金额之和；排名积分 = 对局积分 − 有效扣分，可为负。
+
+    扣分/撤销行、幂等记录与 point_deduction.* 事件在同一事务提交；
+    快照冲突、重复撤销等被拒绝的请求在任何写入之前抛出（不落库）。
+    部分唯一索引保证同一扣分至多有一行 revocation 指向它。
+    """
+
+    __tablename__ = "point_deduction_entries"
+    __table_args__ = (
+        Index(
+            "uq_point_deduction_revoke_target",
+            "reversed_entry_id",
+            unique=True,
+            postgresql_where=text("entry_type = 'revocation'"),
+            sqlite_where=text("entry_type = 'revocation'"),
+        ),
+        Index("ix_point_deduction_tournament", "tournament_id"),
+        Index("ix_point_deduction_participant", "participant_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    participant_id: Mapped[int] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    # deduction（扣分）/ revocation（撤销）
+    entry_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 分值（半分单位的正整数）：扣分值；撤销行为恢复的同等分值
+    amount_halves: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 扣分 / 撤销理由
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    # effective（生效中）/ revoked（扣分已被撤销）；revocation 恒为 effective
+    status: Mapped[str] = mapped_column(
+        String(16), default="effective", nullable=False
+    )
+    # 撤销行指向的原扣分行；扣分行为 NULL
+    reversed_entry_id: Mapped[int | None] = mapped_column(
+        ForeignKey("point_deduction_entries.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    # 操作前断言的赛事当前最大事件序号（乐观快照，不一致不落库）
+    expected_event_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+
+class PointDeductionAction(Base):
+    """扣分/撤销请求的幂等记录：同一 request_id 重放原样返回。
+
+    request_id 在赛事内唯一（扣分与撤销共用同一命名空间）；记录与
+    账本行、point_deduction.* 事件在同一事务中提交。资格不符/快照
+    冲突/重复撤销等被拒绝的请求（409）不落任何记录。
+    """
+
+    __tablename__ = "point_deduction_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "request_id", name="uq_point_deduction_action_request"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    entry_id: Mapped[int] = mapped_column(
+        ForeignKey("point_deduction_entries.id", ondelete="CASCADE"), nullable=False
+    )
+    # 客户端幂等键：赛事内唯一
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # deduct（扣分）/ revoke（撤销）
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 请求参数指纹：deduct {participant_id, amount_halves, reason,
+    # expected_event_seq}；revoke {reversed_entry_id, reason,
+    # expected_event_seq}
+    params: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 首次执行后的响应快照：重复 request_id 原样返回
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )

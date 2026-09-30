@@ -33,6 +33,8 @@ ANNOUNCEMENT_PUBLISHED = "announcement.published"
 ANNOUNCEMENT_ACKNOWLEDGED = "announcement.acknowledged"
 RESULT_REVIEW_CREATED = "result_review.created"
 RESULT_REVIEW_CLOSED = "result_review.closed"
+POINT_DEDUCTION_REGISTERED = "point_deduction.registered"
+POINT_DEDUCTION_REVOKED = "point_deduction.revoked"
 
 
 def _allocate_next_seq(db: Session, tournament_id: int) -> int:

@@ -60,7 +60,9 @@ def generate_next_round(
     )
     next_no = (rounds[-1].round_no + 1) if rounds else 1
 
-    # 当前排名（仅统计已结束轮次）：积分降序 -> Buchholz 降序 -> 编号升序
+    # 当前排名（仅统计已结束轮次）：排名积分降序 -> Buchholz 降序
+    # -> 编号升序。points 为排名积分（对局积分 - 有效扣分，可为负），
+    # 下一轮积分分组以此为准。
     records = compute_records(db, tournament_id)
     ranking_ids = [r.participant_id for r in records]
     points_by_id = {r.participant_id: r.points for r in records}
